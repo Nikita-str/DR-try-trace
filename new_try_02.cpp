@@ -21,6 +21,11 @@
 #include <vector>
 #include <map>
 
+#define tab "    "
+#define sp5 "     "
+static const char *spaces = sp5 sp5 sp5 sp5 sp5 sp5 sp5 "                        ";
+#undef sp5
+
 
 struct module_info//TODO:OUT FROM THIS FILE   | TODO:C++
 {
@@ -37,6 +42,9 @@ static std::vector<module_info> modules;//MAYBE:<module_info *>   |   now, while
 
 static bool with_reg = true;
 
+static void *instr_mutex;
+static void *instr_mutex_2;
+
 inline bool check_ptr_in_module(app_pc ptr, size_t index)
 {
     return modules[index].start <= ptr && ptr < modules[index].end && dr_module_contains_addr(modules[index].m_data, ptr);
@@ -51,28 +59,50 @@ size_t get_module_id(app_pc ptr)
     return 0;
 }
 
+void
+clean_call_write_regs()
+{
+    dr_mcontext_t context = {sizeof(context), DR_MC_ALL};
+    if (dr_get_mcontext(dr_get_current_drcontext(), &context)) {
+        #ifdef X86_32
+        dr_fprintf(trace_file, "%.*sREGs: " "eax = 0x%X" tab "ebx = 0x%X"  tab "ecx = 0x%X" tab "edx = 0x%X" tab "eip = 0x%X" tab "rflags = 0x%X" "\n",
+            6, spaces, context.eax, context.ebx, context.ecx, context.edx, context.eip, context.flags);
+        #else
+        TODO
+        #endif
+    }
+    dr_mutex_unlock(instr_mutex);
+}
+
 dr_emit_flags_t 
 insertion_func(void *drcontext, void *tag, instrlist_t *instrlist, instr_t *inst, bool for_trace, bool translating, void *user_data)//for every instruction
 {
     static void *prev_tag = NULL;
+    static uint prev_module_id = 0;
     static size_t offset = 0;
+    //dr_mutex_lock(instr_mutex);
+    app_pc ptr = instr_get_app_pc(inst); // (app_pc)tag;
+
     if (prev_tag != tag) {
-        static uint prev_module_id = 0;
         offset = 0;
         thread_id_t thr_id = dr_get_thread_id(drcontext);
         
         //or: dr_lookup_module?
-        if (!(prev_module_id && check_ptr_in_module((app_pc)tag, prev_module_id))) {
-            prev_module_id = get_module_id((app_pc)tag);
+        if (!(prev_module_id && check_ptr_in_module(ptr, prev_module_id))) {
+            prev_module_id = get_module_id(ptr);
         }
-        if(!prev_module_id) dr_fprintf(trace_file, "[%0p] [thread id = %u] [code is outside modules]:\n", tag, thr_id);
-        else dr_fprintf(trace_file, "[%0p] [thread id = %u] [module id = %d]:\n", tag, thr_id, prev_module_id);
+        if(!prev_module_id) dr_fprintf(trace_file, "[%0p] [thread id = %u] [code is outside modules]:\n", ptr, thr_id);
+        else dr_fprintf(trace_file, "[%0p] [thread id = %u] [module id = %d]:\n", ptr, thr_id, prev_module_id);
 
         prev_tag = tag;
     }
-    #define tab "    "
-    const char *spaces = "               ";
+
     int add_spaces = 8;
+    size_t m_offset = (ptr - modules[prev_module_id].start);//.start
+    { size_t ofs = m_offset/10; while (ofs) { add_spaces--; ofs /= 10; } if (add_spaces < 1)add_spaces = 1; }
+    dr_fprintf(trace_file, tab "m_ofs: +%d%.*s", m_offset, add_spaces, spaces);
+
+    add_spaces = 8;
     { size_t ofs = offset / 10; while (ofs) { add_spaces--; ofs /= 10; } if (add_spaces < 1)add_spaces = 1; }
     int opcode = instr_get_opcode(inst);
     if (!instr_is_encoding_possible(inst)) {
@@ -90,20 +120,29 @@ insertion_func(void *drcontext, void *tag, instrlist_t *instrlist, instr_t *inst
 
     }
     
+    byte pcs[20] = {0};
+    instr_encode(drcontext, inst, pcs);
+    size_t instr_len = instr_length(drcontext, inst);
+    for (size_t i = 0; i < instr_len; i++) {
+        dr_fprintf(trace_file, " %02X", pcs[i]);
+    }
+    add_spaces = add_spaces + 20 - instr_len * 3;
+    if (add_spaces < 1)add_spaces = 1;
+
     dr_mcontext_t context = {sizeof(context), DR_MC_ALL};
     if (dr_get_mcontext(dr_get_current_drcontext(), &context)) {
+        //dr_insert_clean_call(drcontext, instrlist, inst, clean_call_write_regs, false, 0); 
         #ifdef X86_32
-        dr_fprintf(trace_file, "%.*sREGs: " "eax = 0x%X" tab "ebx = 0x%X"  tab "ecx = 0x%X" tab "edx = 0x%X" tab "eip = 0x%X",
-                    add_spaces, spaces, context.eax, context.ebx, context.ecx, context.edx, context.eip);
+        dr_fprintf(trace_file, "%.*sREGs: " "eax = 0x%X" tab "ebx = 0x%X"  tab "ecx = 0x%X" tab "edx = 0x%X" tab "eip = 0x%X" tab "flags = 0x%X",
+                    add_spaces, spaces, context.eax, context.ebx, context.ecx, context.edx, context.eip, context.eflags);
         #else
         TODO
         #endif
     }
 
-    #undef tab
     insertion_func_AFTER_OUT:
     dr_fprintf(trace_file, "\n");
-    offset += instr_length(drcontext, inst);
+    offset += instr_len;
     return DR_EMIT_DEFAULT;
 }
 
@@ -176,6 +215,8 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
         DR_ASSERT(false);
     }
 
+    instr_mutex = dr_mutex_create();
+
     dr_register_exit_event(event_exit);
 
     //for syscall analysis: (l guess)
@@ -195,3 +236,6 @@ void dr_client_main(client_id_t id, int argc, const char *argv[])
         DR_ASSERT(false);
     }
 }
+
+#undef tab
+
